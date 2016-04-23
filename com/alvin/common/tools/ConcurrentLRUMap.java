@@ -1,233 +1,383 @@
 package com.alvin.common.tools;
 
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Random;
+/**
+ * @author lialiu
+ */
 import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.LinkedBlockingQueue;
 
-/**
- * @author lialiu
- */
 public class ConcurrentLRUMap<K, V> {
-    private final ConcurrentMap<K, MapNode<K, V>> map;
-    private final int capacity;
-    private final ListWalker walker = new ListWalker();
+	private final ConcurrentMap<K, MapNode<K, V>> map;
+	private final int capacity;
+	private final ListWalker walker;
 
-    public ConcurrentLRUMap(int capacity, Class<? extends ConcurrentMap> cls) throws InstantiationException, IllegalAccessException {
-        this.capacity = capacity;
-        this.map = cls.newInstance();
-        walker.setDaemon(true);
-        walker.start();
-    }
+	public ConcurrentLRUMap(int capacity, Class<? extends ConcurrentMap> cls)
+			throws InstantiationException, IllegalAccessException {
+		this.capacity = capacity;
+		this.map = cls.newInstance();
+		walker = new ListWalker();
+		walker.setDaemon(true);
+		walker.start();
+	}
 
-    public void printList(){
-        walker.printList();
-    }
+	public void printList() {
+		walker.printList();
+	}
 
-    public void put(K key, V value) {
-        MapNode<K, V> node = map.get(key);
-        if(node == null){
-        		node = new MapNode<K, V>(key, value);
-        		map.put(key, node);
-        		walker.add(node);
-        }else{
-        	node.data = value;
-        	walker.touch(node);
-        }
-    }
+	public void checkMap() {
+		walker.checkMap();
+	}
 
-    public V get(K key) {
-        MapNode<K, V> node = map.get(key);
-        if (node != null) {
-            walker.touch(node);
-            return node.data;
-        }
-        return null;
-    }
+	public void put(K key, V value) {
+		MapNode<K, V> node = new MapNode<K, V>(key, value);
+		MapNode<K, V> oldNode = map.putIfAbsent(key, node);
 
-    public boolean contains(K key) {
-        MapNode<K, V> node = map.get(key);
-        if (node != null) {
-            walker.touch(node);
-            return true;
-        }
-        return false;
-    }
+		// both Sync is necessary for here to avoid touch enqueue before add.
+		if (oldNode != null) {
+			synchronized (oldNode) {
+				oldNode.data = value;
+				walker.touch(oldNode);
+			}
+		} else {
+			synchronized (node) {
+				walker.add(node);
+			}
+		}
+	}
 
-    public void remove(K key) {
-        MapNode<K, V> node = map.remove(key);
-        if (node != null) {
-            walker.remove(node);
-        }
-    }
+	public V get(K key) {
+		MapNode<K, V> node = map.get(key);
+		if (node != null) {
+			synchronized (node) {
+				if(node.isAlive){
+					walker.touch(node);
+					return node.data;
+				}
+			}
+		}
+		return null;
+	}
 
-    public Set<K> keySet(){
-        return map.keySet();
-    }
+	public boolean contains(K key) {
+		MapNode<K, V> node = map.get(key);
+		if (node != null) {
+			synchronized (node) {
+				walker.touch(node);
+				return true;
+			}
+		}
+		return false;
+	}
 
-    public int size() {
-        return map.size();
-    }
+	public void remove(K key) {
+		MapNode<K, V> node = map.remove(key);
+		if (node != null) {
+			walker.remove(node);
+		}
+	}
 
-    public void stop() {
-        walker.stopRunning();
-    }
+	public Set<K> keySet() {
+		return map.keySet();
+	}
 
-    public void finalize() {
-        walker.stopRunning();
-    }
+	public int size() {
+		return map.size();
+	}
 
-    public void printMap() {
-        for (K key : map.keySet()) {
-            System.out.print(map.get(key).data + ",");
-        }
-        System.out.println();
-        walker.printList();
-    }
+	public void stop() {
+		walker.stopRunning();
+	}
 
-    static private class MapNode<K, V>
+	public void finalize() {
+		walker.stopRunning();
+	}
 
-    {
+	public void printMap() {
+		for (K key : map.keySet()) {
+			System.out.print(map.get(key).data + ",");
+		}
+		System.out.println();
+		 walker.printList();
+	}
 
-        private V data;
-        private K key;
-        private MapNode<K, V> prev;
-        private MapNode<K, V> next;
+	static private class MapNode<K, V> {
+		private volatile V data;
+		private volatile K key;
+		private volatile MapNode<K, V> prev;
+		private volatile MapNode<K, V> next;
+		private volatile boolean isAlive = false;
 
-        public MapNode() {
-        }
+		public MapNode() {
+		}
 
-        private MapNode(K key, V data) {
-            this.data = data;
-            this.key = key;
-        }
-    }
+		private MapNode(K key, V data) {
+			synchronized (key) {
+				this.data = data;
+				this.key = key;
+			}
+		}
 
-    private class ListWalker extends Thread {
-        private final BlockingQueue<Event> queue = new LinkedBlockingQueue<Event>();
-        private final MapNode<K, V> dummyNode = new MapNode<K, V>();;
-        private volatile MapNode<K, V> head = dummyNode;
-        private volatile boolean runningFlag = true;
-        private volatile int listLength = 0;
+		@Override
+		public int hashCode() {
+			final int prime = 31;
+			int result = 1;
+			result = prime * result + ((data == null) ? 0 : data.hashCode());
+			result = prime * result + ((key == null) ? 0 : key.hashCode());
+			return result;
+		}
 
-        public ListWalker() {
-        }
+		@Override
+		public boolean equals(Object obj) {
+			if (this == obj)
+				return true;
+			if (obj == null)
+				return false;
+			if (getClass() != obj.getClass())
+				return false;
+			MapNode other = (MapNode) obj;
+			if (data == null) {
+				if (other.data != null)
+					return false;
+			} else if (!data.equals(other.data))
+				return false;
+			if (key == null) {
+				if (other.key != null)
+					return false;
+			} else if (!key.equals(other.key))
+				return false;
+			return true;
+		}
+	}
 
-        public void printList() {
-            MapNode<K, V> node = head;
-            while (node != dummyNode) {
-                System.out.print(node.data + "->");
-                node = node.next;
-            }
-            System.out.println();
-        }
-        
-        public void add(MapNode<K, V> node) {
-            queue.offer(new Event(Event.ADD, node));
-        }
+	private class ListWalker extends Thread {
+		private final BlockingQueue<Event> queue = new LinkedBlockingQueue<Event>();
+		private final MapNode<K, V> tail = new MapNode<K, V>();
+		private final MapNode<K, V> head = new MapNode<K, V>();
+		private volatile boolean runningFlag = true;
+		private volatile int listLength = 0;
 
-        public void touch(MapNode<K, V> node) {
-            queue.offer(new Event(Event.TOUCH, node));
-        }
+		public ListWalker() {
+			head.next = tail;
+			tail.prev = head;
+		}
 
-        public void remove(MapNode<K, V> node) {
-            queue.offer(new Event(Event.REMOVE, node));
-        }
+		public void checkMap() {
+			System.out.println("List size:" + size());
+			System.out.println("Map size:" + map.size());
+			for (MapNode<K, V> node = head.next; node != tail; node = node.next) {
+				if (!map.containsKey(node.key)) {
+					System.out.println("Key not in map:" + node.key);
+				} else {
+					map.remove(node.key);
+				}
+			}
 
-        public void stopRunning() {
-            runningFlag = false;
-        }
+			for (K key : map.keySet()) {
+				System.out.println("Key not in list:" + map.get(key));
+			}
+		}
 
-        @Override
-        public void run() {
-            while (runningFlag) {
-                try {
-                    Event event = queue.take();
-                    if (event.action == Event.TOUCH) {
-                        MapNode<K, V> node = event.data;
-                        unLink(node);
-                        toHead(node);
-                    }else if (event.action == Event.ADD) {
-                        MapNode<K, V> node = event.data;
-                        toHead(node);
-                        listLength++;
-                    }
-                    else if (event.action == Event.REMOVE) {
-                        unLink(event.data);
-                        listLength--;
-                    }
-                    evict();
-                } catch (InterruptedException e) {
-                    // TODO Auto-generated catch block
-                    e.printStackTrace();
-                }
-            }
-        }
+		public void printList() {
+			 MapNode<K, V> node = head.next;
+			 while (node != tail) {
+			 System.out.print(node.data + "->");
+			 node = node.next;
+			 }
+			 System.out.println();
+		}
 
-        private void evict() {
-            if (listLength > capacity) {
-                System.out.println("evict, size=" + listLength+"," +map.size());
-                MapNode<K, V> deadNode = dummyNode.prev;
-                while (deadNode != null && listLength > capacity) {
-                    MapNode<K, V> prevNode = deadNode.prev;
-                    if(map.remove(deadNode.key)!=null){
-                    	unLink(deadNode);
-                    	listLength--;
-                    }
-                    deadNode = prevNode;
-                }
-            }
-        }
+		public void touch(MapNode<K, V> node) {
+			synchronized (node) {
+				queue.offer(new Event(Event.TOUCH, node));
+			}
+		}
 
-        private MapNode<K, V> unLink(MapNode<K, V> node) {
-            if (node.prev != null) {
-                node.prev.next = node.next;
-            }
-            if (node.next != null) {
-                node.next.prev = node.prev;
-            }
-            node.next = null;
-            node.prev = null;
-            return node;
-        }
+		public void add(MapNode<K, V> node) {
+			synchronized (node) {
+				queue.offer(new Event(Event.ADD, node));
+			}
+		}
 
-        private MapNode<K, V> toHead(MapNode<K, V> node) {
-            if (node == head) {
-                return node;
-            }
-            MapNode<K, V> oldHead = head;
-            head = node;
-            head.next = oldHead;
-            oldHead.prev = head;
-            return node;
-        }
+		public void remove(MapNode<K, V> node) {
+			synchronized (node) {
+				queue.offer(new Event(Event.REMOVE, node));
+			}
+		}
 
-        private class Event
+		public void stopRunning() {
+			runningFlag = false;
+		}
 
-        {
-            public static final String TOUCH = "touch";
-            public static final String REMOVE = "remove";
-            public static final String ADD = "add";
+		public int size() {
+			return listLength;
+		}
 
-            private MapNode<K, V> data;
-            private String action;
+		@Override
+		public void run() {
+			while (runningFlag) {
+				try {
+					Event event = queue.take();
+					MapNode<K, V> node = event.data;
+					synchronized (node) {
+						if (event.action == Event.TOUCH) {
+							if (node.isAlive == false) {
+//								System.out.println("Got dead");
+								continue;
+							}
+							unLink(node);
+							toHead(node);
+						} else if (event.action == Event.ADD) {
+							toHead(node);
+							node.isAlive = true;
+							listLength++;
+						} else if (event.action == Event.REMOVE) {
+							unLink(event.data);
+							event.data.isAlive = false;
+							listLength--;
+						}
+					}
+					evict();
+				} catch (InterruptedException e) {
+					// TODO Auto-generated catch block
+					e.printStackTrace();
+				}
+			}
+		}
 
-            public Event(String action, MapNode<K, V> data) {
-                this.action = action;
-                this.data = data;
-            }
-        }
-    }
-    
-    public static void main(String args[]) throws InterruptedException, InstantiationException, IllegalAccessException{
-        ConcurrentLRUMap<Integer, String> map = new ConcurrentLRUMap<Integer, String>(10, ConcurrentHashMap.class);
-        for (int i = 0; i < 100; i++) {
-            map.put(i, ""+i);
-        }
+		private void evict() {
+			if (map.size() > capacity) {
+				MapNode<K, V> deadNode = tail.prev;
+				while (deadNode != head && map.size() > capacity) {
+					// this line fail at 100 thread 100 loop
+					MapNode<K, V> prevNode = null;
+					synchronized (deadNode) {
+						prevNode = deadNode.prev;
+						if (map.remove(deadNode.key) != null) {
+							unLink(deadNode);
+							deadNode.isAlive = false;
+							listLength--;
+						}
+					}
+					deadNode = prevNode;
+				}
+			}
+		}
 
-        for(int key: map.keySet()){
-            System.out.print(map.get(key)+",");
-        }
-    }
+		private MapNode<K, V> unLink(MapNode<K, V> node) {
+			if (node.prev != null) {
+				node.prev.next = node.next;
+			}
+			if (node.next != null) {
+				node.next.prev = node.prev;
+			}
+			node.next = null;
+			node.prev = null;
+			return node;
+		}
+
+		private MapNode<K, V> toHead(MapNode<K, V> node) {
+			if (node == head.next) {
+				return node;
+			}
+			MapNode<K, V> oldHead = head.next;
+			head.next = node;
+			node.prev = head;
+			node.next = oldHead;
+			oldHead.prev = node;
+			return node;
+		}
+
+		private class Event
+
+		{
+			public static final String ADD = "add";
+			public static final String TOUCH = "touch";
+			public static final String REMOVE = "remove";
+
+			private final MapNode<K, V> data;
+			private final String action;
+
+			public Event(String action, MapNode<K, V> data) {
+				this.action = action;
+				this.data = data;
+			}
+
+			@Override
+			public int hashCode() {
+				final int prime = 31;
+				int result = 1;
+				result = prime * result + ((action == null) ? 0 : action.hashCode());
+				result = prime * result + ((data == null) ? 0 : data.hashCode());
+				return result;
+			}
+
+			@Override
+			public boolean equals(Object obj) {
+				if (this == obj)
+					return true;
+				if (obj == null)
+					return false;
+				if (getClass() != obj.getClass())
+					return false;
+				Event other = (Event) obj;
+				if (action == null) {
+					if (other.action != null)
+						return false;
+				} else if (!action.equals(other.action))
+					return false;
+				if (data == null) {
+					if (other.data != null)
+						return false;
+				} else if (!data.equals(other.data))
+					return false;
+				return true;
+			}
+		}
+	}
+
+	static int xx = 0;
+
+	public static void main(String args[]) throws InterruptedException, InstantiationException, IllegalAccessException {
+		final ConcurrentLRUMap<Integer, Integer> map = new ConcurrentLRUMap<Integer, Integer>(10,
+				ConcurrentHashMap.class);
+
+		for (xx = 0; xx < 10000; xx++) {
+			Thread tr = new Thread() {
+				Random rand = new Random(System.currentTimeMillis());
+
+				public void run() {
+					for (int j = 1; j < 1000; j++) {
+						int num = rand.nextInt(j);
+						if(num < j/2){
+							map.get(rand.nextInt(j-1));
+							
+						}else{
+							map.put(num, num);
+						}
+					}
+				}
+			};
+			tr.setDaemon(true);
+			tr.start();
+		}
+
+		 Thread.currentThread().sleep(2000);
+		
+//		 map.put(6,6);
+//		 map.put(7,7);
+//		 map.put(8,8);
+		
+		
+//		Thread.currentThread().sleep(3000);
+
+		map.printList();
+		map.printMap();
+		map.checkMap();
+	}
 }
